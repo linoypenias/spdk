@@ -50,17 +50,60 @@ DEFINE_STUB(rte_hash_del_key_with_hash, int32_t,
 	     const void *key, hash_sig_t sig),
 	    0);
 DEFINE_STUB(rte_hash_hash, hash_sig_t, (const struct rte_hash *h, const void *key), 0);
-DEFINE_STUB(rte_hash_lookup_with_hash_data, int,
-	    (const struct rte_hash *h,
-	     const void *key, hash_sig_t sig, void **data),
-	    -ENOENT);
-DEFINE_STUB(rte_hash_add_key_with_hash_data, int,
-	    (const struct rte_hash *h,
-	     const void *key, hash_sig_t sig, void *data),
-	    0);
 DEFINE_STUB_V(rte_hash_free, (struct rte_hash *h));
-DEFINE_STUB(rte_hash_create, struct rte_hash *, (const struct rte_hash_parameters *params),
-	    (void *)1);
+DEFINE_STUB(spdk_bdev_get_buf_align, size_t, (const struct spdk_bdev *bdev), 0);
+DEFINE_STUB(spdk_bdev_queue_io_wait, int, (struct spdk_bdev *bdev, struct spdk_io_channel *ch,
+		struct spdk_bdev_io_wait_entry *entry), 0);
+DEFINE_STUB(spdk_io_channel_from_ctx, struct spdk_io_channel *, (void *ctx), NULL);
+DEFINE_STUB(spdk_io_channel_get_thread, struct spdk_thread *, (struct spdk_io_channel *ch), NULL);
+
+struct hash_mock {
+	uint64_t key;
+	void *value;
+};
+
+int
+rte_hash_lookup_with_hash_data(const struct rte_hash *_h,
+			       const void *_key, hash_sig_t sig, void **data)
+{
+	struct hash_mock *h = (struct hash_mock *)_h;
+	uint64_t key = *((uint64_t *)_key);
+
+	if (h->value == NULL || key != h->key) {
+		return -ENOENT;
+	} else {
+		*data = h->value;
+		return 0;
+	}
+}
+
+int
+rte_hash_add_key_with_hash_data(const struct rte_hash *_h,
+				const void *_key, hash_sig_t sig, void *data)
+{
+	struct hash_mock *h = (struct hash_mock *)_h;
+
+	h->key = *((uint64_t *)_key);
+	h->value = data;
+
+	return 0;
+}
+
+struct rte_hash *
+rte_hash_create(const struct rte_hash_parameters *params)
+{
+	static struct hash_mock h;
+
+	h.value = NULL;
+	return (struct rte_hash *)&h;
+}
+
+int
+spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx)
+{
+	fn(ctx);
+	return 0;
+}
 
 struct raid5_params {
 	uint8_t num_base_bdevs;
@@ -177,10 +220,31 @@ static struct raid5_info *
 create_raid5(struct raid5_params *params)
 {
 	struct raid_bdev *raid_bdev = create_raid_bdev(params);
+	struct raid5_info *r5info;
+	unsigned int i;
+	int ret;
 
-	SPDK_CU_ASSERT_FATAL(raid5_start(raid_bdev) == 0);
+	/* mock chunk buffers allocation */
+	MOCK_SET(spdk_dma_malloc, (void *)1);
 
-	return raid_bdev->module_private;
+	ret = raid5_start(raid_bdev);
+
+	MOCK_CLEAR(spdk_dma_malloc);
+
+	SPDK_CU_ASSERT_FATAL(ret == 0);
+
+	r5info = raid_bdev->module_private;
+
+	for (i = 0; i < RAID5_MAX_STRIPES; i++) {
+		uint8_t j;
+
+		for (j = 0; j < params->num_base_bdevs; j++) {
+			/* don't try to free the mock chunk buffers */
+			r5info->stripes[i].chunk_buffers[j] = NULL;
+		}
+	}
+
+	return r5info;
 }
 
 static void
@@ -369,6 +433,7 @@ struct raid_io_info {
 	uint64_t stripe_offset_blocks;
 	void *buf;
 	size_t buf_pos;
+	void *parity_buf;
 	TAILQ_HEAD(, spdk_bdev_io) bdev_io_queue;
 };
 
@@ -403,6 +468,7 @@ init_io_info(struct raid_io_info *io_info, enum spdk_bdev_io_type type,
 	io_info->stripe_offset_blocks = stripe_offset_blocks;
 	io_info->buf = NULL;
 	io_info->buf_pos = 0;
+	io_info->parity_buf = NULL;
 	TAILQ_INIT(&io_info->bdev_io_queue);
 }
 
@@ -434,16 +500,22 @@ run_for_each_raid_io(void (*test_fn)(struct raid_io_info *))
 			{ params->strip_size - 1, 1 },
 			{ params->strip_size - 1, params->strip_size },
 			{ params->strip_size - 1, params->strip_size + 1 },
+			{ params->strip_size - 1, 2 },
 		};
 		struct raid5_info *r5info;
-		struct raid_bdev_io_channel raid_ch;
+		struct {
+			struct raid_bdev_io_channel raid_ch;
+			struct raid5_io_channel r5ch;
+		} ch;
 		unsigned int i;
 
 		r5info = create_raid5(params);
 
-		raid_ch.num_channels = params->num_base_bdevs;
-		raid_ch.base_channel = calloc(params->num_base_bdevs, sizeof(struct spdk_io_channel *));
-		SPDK_CU_ASSERT_FATAL(raid_ch.base_channel != NULL);
+		ch.raid_ch.num_channels = params->num_base_bdevs;
+		ch.raid_ch.base_channel = calloc(params->num_base_bdevs, sizeof(struct spdk_io_channel *));
+		SPDK_CU_ASSERT_FATAL(ch.raid_ch.base_channel != NULL);
+
+		raid5_io_channel_resource_init(r5info->raid_bdev, &ch.r5ch);
 
 		for (i = 0; i < SPDK_COUNTOF(test_requests); i++) {
 			uint64_t stripe_idx;
@@ -460,7 +532,7 @@ run_for_each_raid_io(void (*test_fn)(struct raid_io_info *))
 					struct raid_io_info io_info;
 
 					init_io_info(&io_info, *io_type,
-						     r5info, &raid_ch,
+						     r5info, &ch.raid_ch,
 						     stripe_idx * r5info->stripe_blocks + test_requests[i].stripe_offset_blocks,
 						     test_requests[i].num_blocks,
 						     stripe_idx,
@@ -471,7 +543,9 @@ run_for_each_raid_io(void (*test_fn)(struct raid_io_info *))
 			}
 		}
 
-		free(raid_ch.base_channel);
+		raid5_io_channel_resource_deinit(r5info->raid_bdev, &ch.r5ch);
+
+		free(ch.raid_ch.base_channel);
 
 		delete_raid5(r5info);
 	}
@@ -503,6 +577,8 @@ __test_raid5_handle_stripe(struct raid_io_info *io_info)
 
 	stripe_req = TAILQ_LAST(&stripe->requests, requests_head);
 	CU_ASSERT(stripe_req != &dummy_req);
+
+	TAILQ_INIT(&stripe->requests);
 
 	CU_ASSERT_EQUAL(stripe_req->parity_chunk->index, p_idx);
 
@@ -554,25 +630,53 @@ handle_submit_bdev_io(enum spdk_bdev_io_type io_type,
 	struct raid_io_info *io_info;
 	struct spdk_bdev_io *bdev_io;
 	struct chunk *chunk = cb_arg;
-	size_t remaining;
-	int i;
 
 	SPDK_CU_ASSERT_FATAL(cb == raid5_complete_chunk_request);
 
 	stripe_req = raid5_chunk_stripe_req(chunk);
 	io_info = (struct raid_io_info *)spdk_bdev_io_from_ctx(stripe_req->raid_io);
 
-	remaining = num_blocks * io_info->blocklen;
-	for (i = 0; i < iovcnt; i++) {
-		if (io_type == SPDK_BDEV_IO_TYPE_READ) {
-			memcpy(iov[i].iov_base, io_info->buf + io_info->buf_pos, iov[i].iov_len);
-		} else {
-			memcpy(io_info->buf + io_info->buf_pos, iov[i].iov_base, iov[i].iov_len);
-		}
-		io_info->buf_pos += iov[i].iov_len;
-		remaining -= iov[i].iov_len;
+	if (chunk->request_type == CHUNK_READ ||
+	    chunk->request_type == CHUNK_PREREAD) {
+		CU_ASSERT_EQUAL(io_type, SPDK_BDEV_IO_TYPE_READ);
+	} else if (chunk->request_type == CHUNK_WRITE) {
+		CU_ASSERT_EQUAL(io_type, SPDK_BDEV_IO_TYPE_WRITE);
+	} else {
+		CU_FAIL("Unknown chunk request_type");
 	}
-	CU_ASSERT_EQUAL(remaining, 0);
+
+	if ((chunk != stripe_req->parity_chunk || chunk->request_type != CHUNK_READ) &&
+	    (io_info->buf != NULL || io_info->parity_buf != NULL)) {
+		size_t remaining = num_blocks * io_info->blocklen;
+		void *buf;
+		size_t *buf_offset;
+		size_t parity_buf_offset;
+		int i;
+
+		if (chunk == stripe_req->parity_chunk) {
+			buf = io_info->parity_buf;
+			buf_offset = &parity_buf_offset;
+			parity_buf_offset = (offset_blocks % io_info->r5info->raid_bdev->strip_size) * io_info->blocklen;
+		} else {
+			buf = io_info->buf;
+			buf_offset = &io_info->buf_pos;
+		}
+
+		for (i = 0; i < iovcnt; i++) {
+			if (chunk->request_type == CHUNK_PREREAD) {
+				memset(iov[i].iov_base, 0, iov[i].iov_len);
+			} else {
+				if (io_type == SPDK_BDEV_IO_TYPE_READ) {
+					memcpy(iov[i].iov_base, buf + *buf_offset, iov[i].iov_len);
+				} else {
+					memcpy(buf + *buf_offset, iov[i].iov_base, iov[i].iov_len);
+				}
+				*buf_offset += iov[i].iov_len;
+			}
+			remaining -= iov[i].iov_len;
+		}
+		CU_ASSERT_EQUAL(remaining, 0);
+	}
 
 	bdev_io = calloc(1, sizeof(*bdev_io));
 	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
@@ -615,10 +719,21 @@ process_bdev_io_completions(struct raid_io_info *io_info)
 }
 
 static void
+xor_block(uint8_t *a, uint8_t *b, size_t size)
+{
+	while (size-- > 0) {
+		a[size] ^= b[size];
+	}
+}
+
+static void
 __test_raid5_submit_rw_request(struct raid_io_info *io_info)
 {
+	struct raid5_info *r5info = io_info->r5info;
 	void *src_buf, *dest_buf;
+	void *parity_buf = NULL;
 	size_t buf_size = io_info->num_blocks * io_info->blocklen;
+	size_t parity_buf_size = r5info->raid_bdev->strip_size * io_info->blocklen;
 	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(io_info->raid_io);
 	uint64_t block;
 
@@ -641,8 +756,42 @@ __test_raid5_submit_rw_request(struct raid_io_info *io_info)
 		io_info->buf = src_buf;
 		bdev_io->iov.iov_base = dest_buf;
 	} else {
+		struct stripe *stripe;
+		uint8_t i;
+		uint64_t data_offset;
+		uint64_t parity_offset;
+
 		io_info->buf = dest_buf;
 		bdev_io->iov.iov_base = src_buf;
+
+		stripe = raid5_get_stripe(r5info, io_info->stripe_idx);
+		SPDK_CU_ASSERT_FATAL(stripe != NULL);
+		for (i = 0; i < r5info->raid_bdev->num_base_bdevs; i++) {
+			if (stripe->chunk_buffers[i] == NULL) {
+				/* will be freed by raid5_free() */
+				stripe->chunk_buffers[i] = malloc(r5info->raid_bdev->strip_size * io_info->blocklen);
+				SPDK_CU_ASSERT_FATAL(stripe->chunk_buffers[i] != NULL);
+			}
+		}
+
+		parity_buf = calloc(1, parity_buf_size);
+		SPDK_CU_ASSERT_FATAL(parity_buf != NULL);
+
+		io_info->parity_buf = calloc(1, parity_buf_size);
+		SPDK_CU_ASSERT_FATAL(io_info->parity_buf != NULL);
+
+		data_offset = 0;
+		parity_offset = io_info->stripe_offset_blocks;
+		while (data_offset < io_info->num_blocks) {
+			if (parity_offset == r5info->raid_bdev->strip_size) {
+				parity_offset = 0;
+			}
+			xor_block(parity_buf + (parity_offset * io_info->blocklen),
+				  src_buf + (data_offset * io_info->blocklen),
+				  io_info->blocklen);
+			data_offset++;
+			parity_offset++;
+		}
 	}
 
 	raid5_submit_rw_request(io_info->raid_io);
@@ -652,6 +801,13 @@ __test_raid5_submit_rw_request(struct raid_io_info *io_info)
 	CU_ASSERT_EQUAL(io_info->buf_pos, buf_size);
 	CU_ASSERT(memcmp(src_buf, dest_buf, buf_size) == 0);
 
+	if (parity_buf != NULL) {
+		CU_ASSERT(memcmp(parity_buf, io_info->parity_buf, parity_buf_size) == 0);
+
+		free(parity_buf);
+		free(io_info->parity_buf);
+	}
+
 	free(src_buf);
 	free(dest_buf);
 }
@@ -660,6 +816,60 @@ static void
 test_raid5_submit_rw_request(void)
 {
 	run_for_each_raid_io(__test_raid5_submit_rw_request);
+}
+
+static void
+__test_raid5_rmw(struct raid_io_info *io_info)
+{
+	struct raid5_info *r5info = io_info->r5info;
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(io_info->raid_io);
+	struct stripe *stripe;
+	struct stripe_request *stripe_req;
+	struct spdk_bdev_io *chunk_bdev_io, *tmp;
+	struct chunk *chunk;
+	uint64_t to_preread = 0;
+	uint64_t to_write = 0;
+
+	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ ||
+	    io_info->num_blocks == r5info->stripe_blocks) {
+		return;
+	}
+
+	stripe = raid5_get_stripe(r5info, io_info->stripe_idx);
+	SPDK_CU_ASSERT_FATAL(stripe != NULL);
+
+	raid5_submit_rw_request(io_info->raid_io);
+
+	TAILQ_FOREACH_SAFE(chunk_bdev_io, &io_info->bdev_io_queue, internal.link, tmp) {
+		chunk = chunk_bdev_io->internal.caller_ctx;
+
+		CU_ASSERT_EQUAL(chunk->request_type, CHUNK_PREREAD);
+
+		to_preread += chunk->preread_blocks;
+
+		free(chunk_bdev_io);
+	}
+
+	CU_ASSERT(to_preread > 0);
+
+	while ((stripe_req = TAILQ_LAST(&stripe->requests, requests_head))) {
+		CU_ASSERT_EQUAL(stripe_req->raid_io, io_info->raid_io);
+
+		FOR_EACH_CHUNK(stripe_req, chunk) {
+			to_write += chunk->req_blocks;
+		}
+
+		raid5_complete_stripe_request(stripe_req);
+	}
+
+	CU_ASSERT(to_write > 0);
+	CU_ASSERT(to_preread <= to_write);
+}
+
+static void
+test_raid5_rmw(void)
+{
+	run_for_each_raid_io(__test_raid5_rmw);
 }
 
 int
@@ -679,6 +889,13 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_raid5_reclaim_stripes);
 	CU_ADD_TEST(suite, test_raid5_handle_stripe);
 	CU_ADD_TEST(suite, test_raid5_submit_rw_request);
+	CU_ADD_TEST(suite, test_raid5_start);
+	CU_ADD_TEST(suite, test_raid5_chunk_map_iov);
+	CU_ADD_TEST(suite, test_raid5_get_stripe);
+	CU_ADD_TEST(suite, test_raid5_reclaim_stripes);
+	CU_ADD_TEST(suite, test_raid5_handle_stripe);
+	CU_ADD_TEST(suite, test_raid5_submit_rw_request);
+	CU_ADD_TEST(suite, test_raid5_rmw);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();
