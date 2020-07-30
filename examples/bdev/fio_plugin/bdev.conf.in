@@ -1,3 +1,38 @@
 [Malloc]
-  NumberOfLuns 1
-  LunSizeInMB 128
+  	NumberOfLuns 8
+  	LunSizeInMB 128
+
+#[Nvme]
+#        TransportID "trtype:PCIe traddr:0000:0b:00.0" NVMe0
+#        RetryCount 4
+#        TimeoutUsec 0
+#        AcctionOnTimeout None
+#        AdminPollRate 100000
+
+#[RAID0]
+#  	Name Raid0
+#  	RaidLevel 0
+#  	StripSize 64
+#  	NumDevices 1
+#  	Devices NVMe0n1
+
+[RAID0]
+        Name Raid0
+        RaidLevel 0
+        StripSize 64
+        NumDevices 2
+        Devices Malloc6 Malloc7
+
+[RAID5]
+	Name Raid5
+	RaidLevel 5
+	StripSize 64
+  	NumDevices 3
+  	Devices Malloc0 Malloc1 Malloc2
+	
+#[RAID6]
+#        Name Raid6
+#        RaidLevel 6
+#        StripSize 64
+#        NumDevices 4
+#        Devices Malloc3 Malloc4 Malloc5 Malloc6

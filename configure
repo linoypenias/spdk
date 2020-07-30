@@ -101,6 +101,7 @@ function usage()
 	echo " nvme-cuse                 Build NVMe driver with support for CUSE-based character devices."
 	echo "                           No path required."
 	echo " raid5                     Build with bdev_raid module RAID5 support."
+	echo " raid6                     Build with bdev_raid module RAID6 support."
 	echo "                           No path required."
 	echo ""
 	echo "Environment variables:"
@@ -449,6 +450,12 @@ for i in "$@"; do
 		--without-raid5)
 			CONFIG[RAID5]=n
 			;;
+                --with-raid6)
+                        CONFIG[RAID6]=y
+                        ;;
+                --without-raid6)
+                        CONFIG[RAID6]=n
+                        ;;
 		--with-idxd)
 			CONFIG[IDXD]=y
 			;;

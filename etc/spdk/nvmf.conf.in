@@ -229,9 +229,9 @@
   # Number of pre-configured bdevs.
   NumDevices 2
   # Pre-configured bdevs name with Nvme.
-  Devices Nvme2n1 Nvme3n1
+#  Devices Nvme2n1 Nvme3n1
   # Pre-configured bdevs name with Malloc.
-  #Devices Malloc0 Malloc1
+  Devices Malloc0 Malloc1
   # Pre-configured bdevs name with AIO.
   #Devices AIO0 AIO1
 
